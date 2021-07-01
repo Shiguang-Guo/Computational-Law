@@ -5,9 +5,9 @@
 # @Site : 
 # @File : bet-fimodelune.py
 # @Software: PyCharm
+import copy
 import json
 import re
-import time
 
 import numpy as np
 import torch
@@ -16,7 +16,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from transformers import BertModel, BertTokenizer
+from transformers import BertTokenizer, BertForSequenceClassification
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import f1_score
 
 form_label_list = ["其他", "网上电子汇款", "现金", "未知或模糊", "网络贷款平台", "授权支配特定资金账户", "未出借", "银行转账", "票据"]
 borrower_attr_label_list = ["其他组织", "自然人", "法人"]
@@ -39,7 +41,7 @@ name_dict = {
     'type': "担保类型",
     'rate': "约定期内利率（换算成年利率）",
     'calculation_method': "约定计息方式",
-    'repayment': "还款交付形式"
+    'repayment': "还款交付形式",
 }
 
 
@@ -70,7 +72,8 @@ class TaskDataset(Dataset):
         self.name = config['name']
         self.chinesename = name_dict[self.name]
         self.tokenizer = BertTokenizer.from_pretrained(config['bert_path'])
-        self.labels = np.array([self.onehot(item['attr'][self.chinesename], self.name) for item in self.raw_data])
+        # self.labels = np.array([self.onehot(item['attr'][self.chinesename], self.name) for item in self.raw_data])
+        self.labels = np.array([self.getlabel(item['attr'][self.chinesename], self.name) for item in self.raw_data])
 
         input_ids = []
         bert_attention_masks = []
@@ -90,6 +93,10 @@ class TaskDataset(Dataset):
         self.input_ids = torch.cat(input_ids, dim=0)
         self.bert_attention_masks = torch.cat(bert_attention_masks, dim=0)
 
+    def getlabel(self, label, name):
+        label_list = eval(name + '_label_list')
+        return label_list.index(label[0])
+
     def onehot(self, label, name):
         label_list = eval(name + '_label_list')
         vector = np.zeros(len(label_list))
@@ -108,27 +115,29 @@ class Bert_Model(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.input_nums = config['trunc_lenth']
-        self.bert = BertModel.from_pretrained(config['bert_path'])
         self.output_nums = len(eval(config['name'] + '_label_list'))
+        self.bert = BertForSequenceClassification.from_pretrained(config['bert_path'], num_labels=self.output_nums)
         self.fc1 = nn.Linear(self.input_nums, self.output_nums)
 
-    def forward(self, input_id, mask):
-        _, pooled = self.bert(input_id, attention_mask=mask)
-        return self.fc1(pooled)
+    def forward(self, input_id, mask, labels):
+        x = self.bert(input_id, attention_mask=mask, labels=labels)
+        return x
 
 
 if __name__ == '__main__':
     config = {
         'seed': 1,
         'name': 'form',
-        'batch_size': 8,
+        'batch_size': 32,
         'lr': 0.01,
         'wd': 0.005,
         'epoches': 1000,
         'trunc_lenth': 700,
         'bert_path': 'bert-base-chinese',
         'patience': 100,
+        'log_dir': './log/'
     }
+    tb_writer = SummaryWriter(config['log_dir'])
 
     np.random.seed(config['seed'])
     torch.manual_seed(config['seed'])
@@ -138,11 +147,11 @@ if __name__ == '__main__':
     with open('dev.json', 'r', encoding='utf-8')as f:
         test_data = json.load(f)
 
-    config['trunc_lenth'] = int(np.mean(
-        [len(re.sub(u"([^\u4e00-\u9fa5\u0030-\u0039\u0041-\u005a\u0061-\u007a])", "", i['fact'])) for i in
-         train_data]) + 0.99)
+    # config['trunc_lenth'] = int(np.mean(
+    #     [len(re.sub(u"([^\u4e00-\u9fa5\u0030-\u0039\u0041-\u005a\u0061-\u007a])", "", i['fact'])) for i in
+    #      train_data]) + 0.99)
 
-    print(config['trunc_lenth'])
+    # print(config['trunc_lenth'])
 
     traindataset = TaskDataset(train_data, config)
     testdataset = TaskDataset(test_data, config)
@@ -159,36 +168,63 @@ if __name__ == '__main__':
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adagrad(model.parameters(), lr=config['lr'], weight_decay=config['wd'])
 
+    best_loss = 1000000
+    patience = 0
+    best_model = None
     epoch_iter = tqdm(range(config['epoches']))
     for epoch in epoch_iter:
-        start = time.time()
+        patience += 1
+        if patience == config['patience']:
+            break
         model.train()
         train_losses, valid_losses = [], []
         n, m = 0, 0
         for input_ids, attention_masks, labels in trainData:
-            input_ids, attention_masks, labels = input_ids.cuda(), attention_masks.cuda(), labels.cuda()
+            input_ids, attention_masks, labels = input_ids.cuda(), attention_masks.cuda(), labels.long().cuda()
             n += 1
             model.zero_grad()
-            score = model(input_ids, attention_masks)
+            score = model(input_ids, attention_masks, labels)[1]
             train_loss = criterion(score, labels)
             train_loss.backward()
             optimizer.step()
-            train_losses.apprnd(train_loss)
+            train_losses.append(train_loss.cpu().data)
 
-            # 模型评估
+        # 模型评估
         model.eval()
-        label_pred = []
         with torch.no_grad():
             for input_ids, attention_masks, labels in validData:
-                input_ids, attention_masks, labels = input_ids.cuda(), attention_masks.cuda(), labels.cuda()
+                input_ids, attention_masks, labels = input_ids.cuda(), attention_masks.cuda(), labels.long().cuda()
                 m += 1
-                test_score = model(input_ids, attention_masks)
-                valid_loss = criterion(test_score, labels)
-                valid_losses.append(valid_loss)
-                label_pred.append(torch.argmax(test_score.cpu().data, dim=1))
+                valid_score = model(input_ids, attention_masks, labels)[1]
+                valid_loss = criterion(valid_score, labels)
+                valid_losses.append(valid_loss.cpu().data)
+                label_pred=torch.argmax(valid_score.cpu().data, dim=1)
+                f1 = f1_score(labels.cpu().data, label_pred, average='macro')
 
-        end = time.time()
-        runtime = end - start
+        epoch_iter.set_description('epoch: %d, train loss: %.4f, test loss: %.4f, f1: %.2f,patience: %d' %
+                                   (epoch, np.mean(train_losses), np.mean(valid_losses), f1,
+                                    patience))
 
-        epoch_iter.set_description('epoch: %d, train loss: %.4f, test loss: %.4f, time: %.2f' %
-                                   (epoch, np.mean(train_losses).data, np.mean(valid_losses).data, runtime))
+        tb_writer.add_scalar('train_loss', np.mean(train_losses), global_step=epoch)
+        tb_writer.add_scalar('valid_loss', np.mean(valid_losses), global_step=epoch)
+        tb_writer.add_scalar('f1_macro', f1, global_step=epoch)
+        if best_loss > np.mean(valid_losses):
+            best_model = copy.deepcopy(model)
+            best_loss = np.mean(valid_losses)
+            patience = 0
+
+    model = best_model
+    model.eval()
+    label_pred = []
+    test_losses = []
+    with torch.no_grad():
+        for input_ids, attention_masks, labels in testData:
+            input_ids, attention_masks, labels = input_ids.cuda(), attention_masks.cuda(), labels.long().cuda()
+            m += 1
+            test_score = model(input_ids, attention_masks, labels)[1]
+            test_loss = criterion(test_score, labels)
+            test_losses.append(valid_loss.cpu().data)
+            label_pred.append(torch.argmax(valid_score.cpu().data, dim=1))
+            f1 = f1_score(labels, label_pred, average='macro')
+
+    print('loss: {},f1: {}'.format(np.mean(test_losses), f1))
