@@ -113,14 +113,18 @@ class TaskDataset(Dataset):
 class Bert_Model(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.input_nums = config['trunc_lenth']
+        self.input_nums = min(config['trunc_lenth'], 512)
         self.output_nums = len(eval(config['name'] + '_label_list'))
         self.bert = BertModel.from_pretrained(config['bert_path'])
         self.fc1 = nn.Linear(768, self.output_nums)
+        self.LSTM = nn.LSTM(input_size=768, hidden_size=512, num_layers=2, batch_first=True,
+                            bidirectional=True)
+        self.linear = nn.Linear(512 * 2, self.output_nums)
 
     def forward(self, input_id, mask):
         out = self.bert(input_id, attention_mask=mask)
-        return torch.sigmoid(self.fc1(out[1]))
+        out, hidden = self.LSTM(out[0])
+        return torch.mean(torch.sigmoid(self.linear(out)), dim=1)
 
 
 if __name__ == '__main__':
@@ -133,10 +137,10 @@ if __name__ == '__main__':
         'batch_size': 32,
         'lr': 5e-5,
         'wd': 0.0005,
-        'epoches':1000,
+        'epoches': 1000,
         'trunc_lenth': 700,
         'bert_path': 'bert-base-chinese',
-        'patience': 50,
+        'patience': 20,
         'log_dir': './log/'
     }
     config['name'] = args.task
@@ -187,7 +191,7 @@ if __name__ == '__main__':
             # 模型评估
         model.eval()
         with torch.no_grad():
-            for input_ids, attention_masks, labels in validData:
+            for input_ids, attention_masks, labels in testData:
                 input_ids, attention_masks, labels = input_ids.cuda(), attention_masks.cuda(), labels.float().cuda()
                 valid_score = model(input_ids, attention_masks)
                 valid_loss = criterion(valid_score, labels)
